@@ -72,12 +72,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     
-    // ... (rest of main loop for tracking)
+    // ... (rest    // Smoothing state (One Euro Filter)
+    // MinCutoff: Lower = More smoothing when stationary (0.01 is very steady)
+    // Beta: Lower = Less sensitivity to speed (0.002 reduces jitter spikes)
     // Load Calibration
     let profile = CalibrationProfile::load(calibrations_file);
     let mouse = Mouse::new();
-    let mut filter_x = OneEuroFilter::new(1.0, 0.005);
-    let mut filter_y = OneEuroFilter::new(1.0, 0.005);
+    let mut filter_x = OneEuroFilter::new(0.01, 0.002);
+    let mut filter_y = OneEuroFilter::new(0.01, 0.002);
     
     let mut line = String::new();
     loop {

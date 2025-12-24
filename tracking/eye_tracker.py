@@ -103,9 +103,18 @@ try:
             if calib_dot:
                 cx = int(calib_dot[0] * screen_w)
                 cy = int(calib_dot[1] * screen_h)
-                cv2.circle(canvas, (cx, cy), 30, (0, 0, 255), -1) 
-                cv2.circle(canvas, (cx, cy), 8, (255, 255, 255), -1)
-                cv2.putText(canvas, "Look at the DOT and press SPACE", (cx - 150, cy + 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                
+                # Draw large target
+                cv2.circle(canvas, (cx, cy), 50, (0, 0, 255), -1)      # Red body
+                cv2.circle(canvas, (cx, cy), 15, (255, 255, 255), -1)  # White center
+                cv2.circle(canvas, (cx, cy), 55, (255, 255, 255), 2)   # White ring
+                
+                text = "Look at DOT & press SPACE"
+                text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+                text_x = cx - text_size[0] // 2
+                text_y = cy + 100
+                
+                cv2.putText(canvas, text, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
             
             final_display = canvas
         else:
