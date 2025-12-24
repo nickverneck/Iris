@@ -54,69 +54,86 @@ try:
             left_outer = get_landmark_point(landmarks, 263, w, h)
             left_iris = get_landmark_point(landmarks, 473, w, h) # 473 is left iris center
 
-            # Calculate relative position (0.0 to 1.0) of iris between corners
-            # Simple 1D projection for X:
-            # Vector Eye: Outer - Inner
-            # Vector Iris: Iris - Inner
-            # Projection: Dot product / Length^2
+            # Determine Gaze using Static Landmarks (Corners) to avoid eyelid noise
             
-            def get_ratio(inner, outer, iris):
-                eye_vec = outer - inner
+            def get_relative_iris_pos(inner, outer, iris):
+                # Vector from Inner to Outer corner (The "X" axis of the eye)
+                eye_width_vec = outer - inner
+                
+                # Vector from Inner corner to Iris
                 iris_vec = iris - inner
-                eye_len_sq = np.dot(eye_vec, eye_vec)
-                if eye_len_sq == 0: return 0.5
-                x_ratio = np.dot(iris_vec, eye_vec) / eye_len_sq
-                return x_ratio
+                
+                # Project Iris onto Eye Width line (X-coordinate)
+                # Scalar Projection: dot(A, B) / |B|
+                # Normalized ratio (0 to 1 along the line): dot(A, B) / |B|^2
+                denom = np.dot(eye_width_vec, eye_width_vec)
+                if denom == 0: return 0.5, 0.5
+                
+                x_ratio = np.dot(iris_vec, eye_width_vec) / denom
+                
+                # For Y, we need a vector perpendicular to the eye width.
+                # In screen space (approx), Y is perpendicular to X.
+                # Let's rotate eye_width_vec 90 degrees: (dx, dy) -> (-dy, dx)
+                # Note: Screen coords, Y increases down.
+                # If X is (1, 0), Y perp should be (0, 1).
+                # Inner(0,0) -> Outer(10, 0). Vec = (10, 0).
+                # Perpendicular = (0, 10).
+                # If we rotate 90 deg clockwise: (x, y) -> (-y, x)? No.
+                # Let's just use the Orthogonal projection directly.
+                # Y_vec = [-eye_width_vec[1], eye_width_vec[0]] # (-y, x) gives 90 deg rotation
+                
+                # Actually, let's simpler:
+                # Vertical displacement relative to the line connecting corners.
+                # Cross product 2D (determinant) gives area. Area = Base * Height.
+                # Height = Cross / Base.
+                
+                # Cross Product of (EyeWidth) and (IrisVec).
+                # (x1*y2 - y1*x2)
+                cross_prod = eye_width_vec[0] * iris_vec[1] - eye_width_vec[1] * iris_vec[0]
+                
+                # Normalize height by eye width magnitude
+                eye_width_len = np.sqrt(denom)
+                y_disp = cross_prod / eye_width_len
+                
+                # Normalize Y score. 
+                # This displacement is in pixels. We need a ratio relative to something.
+                # Eye height is roughly 1/3 to 1/2 of width?
+                # Let's normalize by eye width just to have a unitless ratio.
+                # Positive = Below line (Screen Y increases down).
+                # Negative = Above line.
+                y_ratio = y_disp / eye_width_len 
+                
+                return x_ratio, y_ratio
 
-            # Y Ratio is trickier with just corners. Let's use eyelid top/bottom.
-            # Right Eye: Top 159, Bottom 145
-            # Left Eye: Top 386, Bottom 374
+            rx, ry = get_relative_iris_pos(right_inner, right_outer, right_iris)
+            lx, ly = get_relative_iris_pos(left_inner, left_outer, left_iris)
             
-            def get_y_ratio(top, bottom, iris):
-                 # Vertical vector
-                 eye_h_vec = bottom - top
-                 iris_vec = iris - top
-                 eye_h_len_sq = np.dot(eye_h_vec, eye_h_vec)
-                 if eye_h_len_sq == 0: return 0.5
-                 y_ratio = np.dot(iris_vec, eye_h_vec) / eye_h_len_sq
-                 return y_ratio
+            # Additional Debug Vis
+            # Draw eye line
+            cv2.line(frame, (int(right_inner[0]), int(right_inner[1])), (int(right_outer[0]), int(right_outer[1])), (255, 0, 0), 1)
+            cv2.line(frame, (int(left_inner[0]), int(left_inner[1])), (int(left_outer[0]), int(left_outer[1])), (255, 0, 0), 1)
 
-            rx_ratio = get_ratio(right_inner, right_outer, right_iris)
-            lx_ratio = get_ratio(left_inner, left_outer, left_iris)
-            
-            right_top = get_landmark_point(landmarks, 159, w, h)
-            right_bottom = get_landmark_point(landmarks, 145, w, h)
-            
-            left_top = get_landmark_point(landmarks, 386, w, h)
-            left_bottom = get_landmark_point(landmarks, 374, w, h)
-            
-            ry_ratio = get_y_ratio(right_top, right_bottom, right_iris)
-            ly_ratio = get_y_ratio(left_top, left_bottom, left_iris)
+            avg_x = (rx + lx) / 2.0
+            avg_y = (ry + ly) / 2.0
 
-            # Average the two eyes
-            avg_x = (rx_ratio + lx_ratio) / 2.0
-            avg_y = (ry_ratio + ly_ratio) / 2.0
-
-            # Normalize/Calibrate broadly (these ratios usually range from 0.3 to 0.7 depending on look)
-            # Let's expand them to 0.0-1.0. 
-            # Empirically, looking left/right might go 0.2 to 0.8
-            # Looking up/down might go 0.2 to 0.8
+            # Output RAW ratios for Rust to handle calibration
+            # avg_x: 0.0 (Left) -> 1.0 (Right) (Theoretical, actual depends on eye physiology)
+            # avg_y: 0.0 (Top) -> 1.0 (Bottom)
             
-            # Sensitivity factors (user can tune these)
-            x_min, x_max = 0.3, 0.7
-            y_min, y_max = 0.3, 0.7 # iris moves less vertically
-            
-            norm_x = (avg_x - x_min) / (x_max - x_min)
-            norm_y = (avg_y - y_min) / (y_max - y_min)
-            
-            norm_x = clamp(norm_x, 0.0, 1.0)
-            norm_y = clamp(norm_y, 0.0, 1.0)
-
-            output = {"x": norm_x, "y": norm_y}
+            output = {"x": avg_x, "y": avg_y}
             print(json.dumps(output))
             sys.stdout.flush()
+            
+            # Debug GUI
+            cv2.putText(frame, f"Raw X: {avg_x:.4f}", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            cv2.putText(frame, f"Raw Y: {avg_y:.4f}", (30, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+        cv2.imshow("Iris Tracker Debug", frame)
+        if cv2.waitKey(1) & 0xFF == 27: # Esc
+            break
 
 except KeyboardInterrupt:
     pass
 finally:
     cap.release()
+    cv2.destroyAllWindows()
