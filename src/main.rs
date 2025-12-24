@@ -1,10 +1,16 @@
 use std::io::{self, BufRead, BufReader, Write};
-use std::process::{Command, Stdio, ChildStdout};
-use std::{thread, time};
+use std::process::{Command, Stdio, ChildStdout, ChildStdin};
+use std::time;
 use serde::Deserialize;
 use mouse_rs::Mouse;
 use display_info::DisplayInfo;
 use clap::Parser;
+
+mod smoothing;
+use smoothing::OneEuroFilter;
+
+mod ipc;
+use ipc::Command as PythonCommand;
 
 mod calibration;
 use calibration::{CalibrationProfile, Point};
@@ -23,34 +29,12 @@ struct GazePoint {
     y: f64,
 }
 
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let calibrations_file = "calibration.json";
 
-    println!("Starting Iris Eye Tracker...");
-
-    // Start Python Process
-    let mut child = Command::new("./venv/bin/python")
-        .arg("tracking/eye_tracker.py")
-        .stdout(Stdio::piped())
-        .spawn()?;
-
-    println!("Vision process started. PID: {}", child.id());
-
-    let stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
-    let mut reader = BufReader::new(stdout);
-
-    if args.calibrate {
-        run_calibration_sequence(&mut reader, calibrations_file)?;
-        println!("Calibration saved. Restart without --calibrate to run.");
-        return Ok(());
-    }
-
-    // Load Calibration
-    let profile = CalibrationProfile::load(calibrations_file);
-    println!("Loaded Profile: {:?}", profile);
-
-    // Get Screen Dimensions
+    // Get Screen Dimensions First
     let displays = DisplayInfo::all()?;
     if displays.is_empty() {
         return Err("No displays found".into());
@@ -58,79 +42,128 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let main_display = &displays[0];
     let screen_width = main_display.width as f64;
     let screen_height = main_display.height as f64;
+    
+    println!("Starting Iris Eye Tracker...");
     println!("Screen Resolution: {}x{}", screen_width, screen_height);
+    
+    // ... spawn process ...
+    let mut child = Command::new("./venv/bin/python")
+        .arg("tracking/eye_tracker.py")
+        .stdout(Stdio::piped())
+        .stdin(Stdio::piped())
+        .spawn()?;
 
+    println!("Vision process started. PID: {}", child.id());
+
+    let stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
+    let mut stdin = child.stdin.take().ok_or("Failed to capture stdin")?;
+    let mut reader = BufReader::new(stdout);
+    
+    // Send Init
+    let init_cmd = PythonCommand::Init { 
+        width: screen_width as u32, 
+        height: screen_height as u32 
+    };
+    writeln!(stdin, "{}", serde_json::to_string(&init_cmd)?)?;
+
+    if args.calibrate {
+        run_calibration_sequence(&mut reader, &mut stdin, calibrations_file)?;
+        println!("Calibration saved. Restart without --calibrate to run.");
+        return Ok(());
+    }
+    
+    // ... (rest of main loop for tracking)
+    // Load Calibration
+    let profile = CalibrationProfile::load(calibrations_file);
     let mouse = Mouse::new();
+    let mut filter_x = OneEuroFilter::new(1.0, 0.005);
+    let mut filter_y = OneEuroFilter::new(1.0, 0.005);
+    
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 { break; }
 
-    // Smoothing state
-    let mut smooth_x = screen_width / 2.0;
-    let mut smooth_y = screen_height / 2.0;
-    let alpha = 0.15; // Slightly smoother
+        if let Ok(raw_point) = serde_json::from_str::<GazePoint>(&line) {
+             let raw = Point { x: raw_point.x, y: raw_point.y };
+             let mapped = profile.map(&raw);
+             let target_x = mapped.x * screen_width;
+             let target_y = mapped.y * screen_height;
+             let smooth_x = filter_x.filter(target_x);
+             let smooth_y = filter_y.filter(target_y);
+             if let Err(_e) = mouse.move_to(smooth_x as i32, smooth_y as i32) {}
+        }
+    }
+    Ok(())
+}
 
+#[derive(Deserialize)]
+struct TriggerMessage {
+    #[serde(rename = "type")]
+    msg_type: String,
+}
+
+fn run_calibration_sequence(reader: &mut BufReader<ChildStdout>, writer: &mut ChildStdin, path: &str) -> std::io::Result<()> {
+    println!("\n=== 5-POINT CALIBRATION ===");
+    println!("The tracker window will go fullscreen.");
+    println!("Look at the RED DOT and press SPACE or ENTER (on the tracking window, not terminal).");
+
+    let points = vec![
+        ("CENTER", 0.5, 0.5),
+        ("TOP LEFT", 0.05, 0.05),
+        ("TOP RIGHT", 0.95, 0.05),
+        ("BOTTOM LEFT", 0.05, 0.95),
+        ("BOTTOM RIGHT", 0.95, 0.95),
+    ];
+
+    let mut results = Vec::new();
+
+    for (name, x, y) in points {
+        // Send command
+        let cmd = PythonCommand::CalibrationPoint { x, y };
+        writeln!(writer, "{}", serde_json::to_string(&cmd)?)?;
+        
+        println!("\nWaiting for user trigger at {}...", name);
+        wait_for_trigger(reader)?;
+
+        println!("Recording...");
+        let pt = collect_point(reader)?;
+        results.push(pt);
+    }
+
+    let cmd = PythonCommand::CalibrationEnd;
+    writeln!(writer, "{}", serde_json::to_string(&cmd)?)?;
+
+    let profile = CalibrationProfile {
+        center: results[0].clone(),
+        top_left: results[1].clone(),
+        top_right: results[2].clone(),
+        bottom_left: results[3].clone(),
+        bottom_right: results[4].clone(),
+    };
+
+    profile.save(path)?;
+    println!("\nCalibration saved into {}!", path);
+    Ok(())
+}
+
+fn wait_for_trigger(reader: &mut BufReader<ChildStdout>) -> std::io::Result<()> {
     let mut line = String::new();
     loop {
         line.clear();
         if reader.read_line(&mut line)? == 0 {
-            break; // EOF
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "EOF"));
         }
-
-        if let Ok(raw_point) = serde_json::from_str::<GazePoint>(&line) {
-             let raw = Point { x: raw_point.x, y: raw_point.y };
-             
-             // Map to Unit Square (0.0-1.0) using Calibration
-             let mapped = profile.map(&raw);
-
-             // Map to Screen
-             let target_x = mapped.x * screen_width;
-             let target_y = mapped.y * screen_height;
-
-             // Apply Smoothing
-             smooth_x = alpha * target_x + (1.0 - alpha) * smooth_x;
-             smooth_y = alpha * target_y + (1.0 - alpha) * smooth_y;
-
-             if let Err(e) = mouse.move_to(smooth_x as i32, smooth_y as i32) {
-                 // eprintln!("Mouse error: {}", e); 
-             }
+        // Check if line is trigger
+        if let Ok(msg) = serde_json::from_str::<TriggerMessage>(&line) {
+            if msg.msg_type == "trigger" {
+                return Ok(());
+            }
         }
     }
-
-    Ok(())
 }
 
-fn run_calibration_sequence(reader: &mut BufReader<ChildStdout>, path: &str) -> std::io::Result<()> {
-    println!("\n=== 5-POINT CALIBRATION ===");
-    println!("We will record 5 points: Center, Top-Left, Top-Right, Bottom-Left, Bottom-Right.");
-    println!("For each point, look at it steadily and press ENTER.");
-    
-    let center = collect_point(reader, "CENTER")?;
-    let top_left = collect_point(reader, "TOP LEFT")?;
-    let top_right = collect_point(reader, "TOP RIGHT")?;
-    let bottom_left = collect_point(reader, "BOTTOM LEFT")?;
-    let bottom_right = collect_point(reader, "BOTTOM RIGHT")?;
-
-    let profile = CalibrationProfile {
-        center,
-        top_left,
-        top_right,
-        bottom_left,
-        bottom_right,
-    };
-
-    profile.save(path)?;
-    println!("\nCalibration saved to {}!", path);
-    Ok(())
-}
-
-fn collect_point(reader: &mut BufReader<ChildStdout>, name: &str) -> std::io::Result<Point> {
-    print!("\nLook at the [{}] and press ENTER...", name);
-    io::stdout().flush()?;
-    
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-
-    println!("Recording (keep looking)...");
-    
-    // Collect samples for 1 second (approx 30 frames)
+fn collect_point(reader: &mut BufReader<ChildStdout>) -> std::io::Result<Point> {
     let mut sum_x = 0.0;
     let mut sum_y = 0.0;
     let mut count = 0;
@@ -150,12 +183,7 @@ fn collect_point(reader: &mut BufReader<ChildStdout>, name: &str) -> std::io::Re
     }
 
     if count == 0 {
-        return Err(io::Error::new(io::ErrorKind::Other, "No data received from eye tracker"));
+        return Err(io::Error::new(io::ErrorKind::Other, "No data received"));
     }
-
-    let avg_x = sum_x / count as f64;
-    let avg_y = sum_y / count as f64;
-    println!("Captured: {:.4}, {:.4}", avg_x, avg_y);
-
-    Ok(Point { x: avg_x, y: avg_y })
+    Ok(Point { x: sum_x / count as f64, y: sum_y / count as f64 })
 }
