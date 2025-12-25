@@ -180,27 +180,43 @@ fn run_diagnostics(
 }
 
 fn run_calibration_sequence(reader: &mut BufReader<ChildStdout>, writer: &mut ChildStdin, path: &str) -> std::io::Result<()> {
-    println!("\n=== 5-POINT CALIBRATION ===");
+    println!("\n=== 9-POINT CALIBRATION ===");
     println!("The tracker window will go fullscreen.");
     println!("Look at the RED DOT and press SPACE or ENTER (on the tracking window, not terminal).");
 
+    // 3x3 Grid: 9 points
     let points = vec![
-        ("CENTER", 0.5, 0.5),
-        ("TOP LEFT", 0.05, 0.05),
-        ("TOP RIGHT", 0.95, 0.05),
-        ("BOTTOM LEFT", 0.05, 0.95),
-        ("BOTTOM RIGHT", 0.95, 0.95),
+        ("CENTER",        0.5,  0.5),
+        ("TOP LEFT",      0.05, 0.05),
+        ("TOP CENTER",    0.5,  0.05),
+        ("TOP RIGHT",     0.95, 0.05),
+        ("MIDDLE LEFT",   0.05, 0.5),
+        ("MIDDLE RIGHT",  0.95, 0.5),
+        ("BOTTOM LEFT",   0.05, 0.95),
+        ("BOTTOM CENTER", 0.5,  0.95),
+        ("BOTTOM RIGHT",  0.95, 0.95),
     ];
 
     let mut results = Vec::new();
 
     // Give Python a moment to initialize the window
     std::thread::sleep(std::time::Duration::from_secs(2));
+    
+    // READY step: Show a dot to ensure display is initialized
+    // This is dismissed without recording data
+    let ready_cmd = PythonCommand::CalibrationPoint { x: 0.5, y: 0.5 };
+    writeln!(writer, "{}", serde_json::to_string(&ready_cmd)?)?;
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    println!("\nPress SPACE when READY...");
+    wait_for_trigger(reader)?;
 
     for (name, x, y) in points {
         // Send command
         let cmd = PythonCommand::CalibrationPoint { x, y };
         writeln!(writer, "{}", serde_json::to_string(&cmd)?)?;
+        
+        // Give Python time to draw the dot
+        std::thread::sleep(std::time::Duration::from_millis(500));
         
         println!("\nWaiting for user trigger at {}...", name);
         wait_for_trigger(reader)?;
@@ -216,9 +232,13 @@ fn run_calibration_sequence(reader: &mut BufReader<ChildStdout>, writer: &mut Ch
     let profile = CalibrationProfile {
         center: results[0].clone(),
         top_left: results[1].clone(),
-        top_right: results[2].clone(),
-        bottom_left: results[3].clone(),
-        bottom_right: results[4].clone(),
+        top_center: results[2].clone(),
+        top_right: results[3].clone(),
+        middle_left: results[4].clone(),
+        middle_right: results[5].clone(),
+        bottom_left: results[6].clone(),
+        bottom_center: results[7].clone(),
+        bottom_right: results[8].clone(),
     };
 
     profile.save(path)?;
