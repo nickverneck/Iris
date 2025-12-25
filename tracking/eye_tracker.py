@@ -34,66 +34,65 @@ def get_landmark_point_3d(landmarks, idx, w, h):
     # MP coords: x,y are [0,1], z is "roughly same scale as x"
     return np.array([point.x * w, point.y * h, point.z * w])
 
-def get_relative_iris_pos(inner, outer, iris):
-    # 1. Center of the eye (surface approximation)
-    eye_center = (inner + outer) / 2.0
+def get_head_basis(landmarks, w, h):
+    # Rigid points to define the head plane
+    # 33: Right Eye Inner (actually MP Right Inner is 133 or 33? 33 is Left-most of right eye i.e. inner)
+    # Let's use Outer corners for stability: 33 (Left of Right Eye), 263 (Right of Left Eye) - wait.
+    # Standard MP Mesh: 33 = Right Eye Inner, 133 = Right Eye Outer. 362 = Left Eye Inner, 263 = Left Eye Outer.
+    # Let's use the two Outer Corners as the horizontal extreme points.
+    r_outer = get_landmark_point_3d(landmarks, 133, w, h)
+    l_outer = get_landmark_point_3d(landmarks, 263, w, h)
+    chin = get_landmark_point_3d(landmarks, 152, w, h)
     
-    # 2. Eye Width Vector (Inner -> Outer) - This defines the "Horizontal" of the eye
-    # We use this to correct for Head Yaw/Roll
-    eye_width_vec = outer - inner
+    # 1. Head Right Vector (Left Eye -> Right Eye)
+    # Note: MP coords have X increasing to the RIGHT of the image.
+    # So L_Outer (on left of screen) has lower X. R_Outer (on right) has higher X.
+    # Vector L->R is positive X.
+    head_right = l_outer - r_outer # Wait, in mirror mode? 
+    # Let's just trust x is x.
+    # If 263 is Left Eye (Viewer's Right if selfie), let's just subtract.
+    head_right = l_outer - r_outer 
+    head_right = head_right / np.linalg.norm(head_right)
     
-    # 3. Iris Vector (Center -> Iris)
-    iris_vec = iris - eye_center
+    # 2. Head Up Vector
+    # Midpoint of eyes
+    eye_mid = (l_outer + r_outer) / 2.0
+    # Vector from Chin to Eye Mid is roughly UP
+    head_up_rough = eye_mid - chin
+    head_up_rough = head_up_rough / np.linalg.norm(head_up_rough)
     
-    # 4. Project Iris movement onto the Eye's coordinate system
+    # 3. Head Forward (Normal)
+    # Cross Right x Up -> Forward (Z)
+    head_fwd = np.cross(head_right, head_up_rough)
+    head_fwd = head_fwd / np.linalg.norm(head_fwd)
     
-    # Basis X: Normalized Eye Width Vector
-    basis_x = eye_width_vec / np.linalg.norm(eye_width_vec)
+    # 4. Re-orthogonalize Up
+    # Forward x Right -> True Up
+    head_up = np.cross(head_fwd, head_right)
+    head_up = head_up / np.linalg.norm(head_up)
     
-    # Basis Y: orthogonal to X (in the general "up" direction)
-    # We need a temporary Up vector. (0, -1, 0) in screen space is up.
-    # But head might be tilted.
-    # Let's approximate "Up" as perpendicular to Basis X in the Z-plane?
-    # Better: Use the cross product with a rough Forward vector?
-    # Simple approach: Just project onto X, and then use the residual for Y.
-    
-    # Project iris_vec onto basis_x
-    x_proj = np.dot(iris_vec, basis_x)
-    
-    # The "Vertical" component is the perpendicular part?
-    # Not exactly, because the eye is a sphere.
-    # Let's convert to normalized coordinates.
-    
-    # Normalize by eye width (scale invariant)
-    eye_width = np.linalg.norm(eye_width_vec)
-    
-    # X Ratio: How far along the width vector?
-    # (Centered at 0)
-    x_score = x_proj / eye_width 
-    
-    # Y Score: The vertical displacement
-    # Remove the X component from the vector
-    y_vec = iris_vec - (basis_x * x_proj)
-    
-    # Ideally we'd project this onto a true "Eye Up" vector, but we don't have one easily.
-    # We can assume "Eye Up" is roughly (0, 1, 0) locally?
-    # Let's just take the Y-component of the residual vector, 
-    # BUT we must account for head roll.
-    # Alternative: Cross product of Basis X and Z-axis?
-    # Let's try simple projection onto the world Y axis first, corrected by scale.
-    # Actually, simplistic: Just taking component perpendicular to eye-width is good enough for now.
-    # Sign? In screen space Y is down.
-    # If y_vec[1] is positive -> down.
-    
-    # Let's use the magnitude of the residual, signed by its Y component.
-    y_mag = np.linalg.norm(y_vec)
-    y_sign = np.sign(y_vec[1]) 
-    y_score = (y_mag * y_sign) / eye_width
+    return head_right, head_up, head_fwd
 
-    # Shift to 0.5 center for compatibility with existing calibration logic
-    # Previous range was 0.0 to 1.0. 
-    # Now it's -0.5 to 0.5 approx.
-    return 0.5 + x_score, 0.5 + y_score
+def get_relative_iris_pos(eye_center, iris, head_right, head_up, scale_ref):
+    # Vector from Eye Center to Iris
+    gaze_vec = iris - eye_center
+    
+    # Project onto Head Axes
+    x_score = np.dot(gaze_vec, head_right)
+    y_score = np.dot(gaze_vec, head_up)
+    
+    # Normalize by scale (e.g. eye distance) to be distance-invariant
+    x_ratio = x_score / scale_ref
+    y_ratio = y_score / scale_ref
+    
+    # Sensitivity multiplier (iris moves ~10-20% of eye width max)
+    # We need to expand this to cover 0.0-1.0 range
+    sensitivity = 5.0
+    
+    # Y-axis inversion: Head "Up" is negative screen Y
+    # When looking DOWN (positive y_score), we want higher screen Y
+    # So we NEGATE y_ratio
+    return 0.5 + (x_ratio * sensitivity), 0.5 - (y_ratio * sensitivity)
 
 # ...
 screen_w, screen_h = 1920, 1080 # Default fallback
@@ -177,33 +176,43 @@ try:
             
             # ... (Landmark extraction code same as before) ...
             # --- Right Eye ---
-            right_inner = get_landmark_point_3d(landmarks, 33, w, h)
-            right_outer = get_landmark_point_3d(landmarks, 133, w, h)
-            right_iris = get_landmark_point_3d(landmarks, 468, w, h)
+            # --- Head Basis ---
+            b_right, b_up, b_fwd = get_head_basis(landmarks, w, h)
+            
+            # Scale reference: Distance between outer corners
+            # right_outer (133) and left_outer (263)
+            # We already computed points in get_head_basis but good to have explicit here or pass it?
+            # Let's recompute points for clarity
+            pt_r_out = get_landmark_point_3d(landmarks, 133, w, h)
+            pt_l_out = get_landmark_point_3d(landmarks, 263, w, h)
+            pt_r_in = get_landmark_point_3d(landmarks, 33, w, h)
+            pt_l_in = get_landmark_point_3d(landmarks, 362, w, h)
+            
+            head_scale = np.linalg.norm(pt_l_out - pt_r_out)
+            
+            # --- Right Eye ---
+            r_center = (pt_r_in + pt_r_out) / 2.0
+            r_iris = get_landmark_point_3d(landmarks, 468, w, h)
             
             # --- Left Eye ---
-            left_inner = get_landmark_point_3d(landmarks, 362, w, h)
-            left_outer = get_landmark_point_3d(landmarks, 263, w, h)
-            left_iris = get_landmark_point_3d(landmarks, 473, w, h)
+            l_center = (pt_l_in + pt_l_out) / 2.0
+            l_iris = get_landmark_point_3d(landmarks, 473, w, h)
 
-            rx, ry = get_relative_iris_pos(right_inner, right_outer, right_iris)
-            lx, ly = get_relative_iris_pos(left_inner, left_outer, left_iris)
+            rx, ry = get_relative_iris_pos(r_center, r_iris, b_right, b_up, head_scale)
+            lx, ly = get_relative_iris_pos(l_center, l_iris, b_right, b_up, head_scale)
             
             # Debug Vis on Camera Frame (if visible)
             if not calibration_mode:
-                # Project back to 2D for drawing
-                r_center = (right_inner[:2] + right_outer[:2]) / 2.0
-                l_center = (left_inner[:2] + left_outer[:2]) / 2.0
-                r_iris_2d = right_iris[:2]
-                l_iris_2d = left_iris[:2]
-
-                # Draw Eye Center to Iris vector
-                cv2.arrowedLine(frame, (int(r_center[0]), int(r_center[1])), (int(r_iris_2d[0]), int(r_iris_2d[1])), (0, 255, 255), 2)
-                cv2.arrowedLine(frame, (int(l_center[0]), int(l_center[1])), (int(l_iris_2d[0]), int(l_iris_2d[1])), (0, 255, 255), 2)
+                # Debug Line: Head Up Axis at Center of Face
+                face_cx, face_cy = int((r_center[0] + l_center[0])/2), int((r_center[1] + l_center[1])/2)
+                up_end = (int(face_cx + b_up[0]*50), int(face_cy + b_up[1]*50))
+                cv2.arrowedLine(frame, (face_cx, face_cy), up_end, (255, 0, 0), 2) # Blue Up
                 
-                # Draw Iris points
-                cv2.circle(frame, (int(r_iris_2d[0]), int(r_iris_2d[1])), 2, (0, 255, 0), -1)
-                cv2.circle(frame, (int(l_iris_2d[0]), int(l_iris_2d[1])), 2, (0, 255, 0), -1)
+                # Debug Line: Gaze Vector
+                r_i_2d = (int(r_iris[0]), int(r_iris[1]))
+                l_i_2d = (int(l_iris[0]), int(l_iris[1]))
+                cv2.circle(frame, r_i_2d, 2, (0, 255, 0), -1)
+                cv2.circle(frame, l_i_2d, 2, (0, 255, 0), -1)
 
             avg_x = (rx + lx) / 2.0
             avg_y = (ry + ly) / 2.0
