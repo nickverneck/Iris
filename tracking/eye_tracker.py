@@ -17,8 +17,8 @@ mp_face_mesh = mp.solutions.face_mesh
 face_mesh = mp_face_mesh.FaceMesh(
     max_num_faces=1,
     refine_landmarks=True,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5
+    min_detection_confidence=0.7,
+    min_tracking_confidence=0.7
 )
 
 cap = cv2.VideoCapture(0)
@@ -29,21 +29,71 @@ cv2.setWindowProperty("Iris Tracker", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSC
 calibration_mode = False
 calib_dot = None # (x, y) relative 0-1
 
-def get_landmark_point(landmarks, idx, w, h):
+def get_landmark_point_3d(landmarks, idx, w, h):
     point = landmarks[idx]
-    return np.array([point.x * w, point.y * h])
-    
+    # MP coords: x,y are [0,1], z is "roughly same scale as x"
+    return np.array([point.x * w, point.y * h, point.z * w])
+
 def get_relative_iris_pos(inner, outer, iris):
-    eye_width_vec = outer - inner
-    iris_vec = iris - inner
-    denom = np.dot(eye_width_vec, eye_width_vec)
-    if denom == 0: return 0.5, 0.5
-    x_ratio = np.dot(iris_vec, eye_width_vec) / denom
+    # 1. Center of the eye (surface approximation)
+    eye_center = (inner + outer) / 2.0
     
-    cross_prod = eye_width_vec[0] * iris_vec[1] - eye_width_vec[1] * iris_vec[0]
-    eye_width_len = np.sqrt(denom)
-    y_ratio = cross_prod / eye_width_len / eye_width_len 
-    return x_ratio, y_ratio
+    # 2. Eye Width Vector (Inner -> Outer) - This defines the "Horizontal" of the eye
+    # We use this to correct for Head Yaw/Roll
+    eye_width_vec = outer - inner
+    
+    # 3. Iris Vector (Center -> Iris)
+    iris_vec = iris - eye_center
+    
+    # 4. Project Iris movement onto the Eye's coordinate system
+    
+    # Basis X: Normalized Eye Width Vector
+    basis_x = eye_width_vec / np.linalg.norm(eye_width_vec)
+    
+    # Basis Y: orthogonal to X (in the general "up" direction)
+    # We need a temporary Up vector. (0, -1, 0) in screen space is up.
+    # But head might be tilted.
+    # Let's approximate "Up" as perpendicular to Basis X in the Z-plane?
+    # Better: Use the cross product with a rough Forward vector?
+    # Simple approach: Just project onto X, and then use the residual for Y.
+    
+    # Project iris_vec onto basis_x
+    x_proj = np.dot(iris_vec, basis_x)
+    
+    # The "Vertical" component is the perpendicular part?
+    # Not exactly, because the eye is a sphere.
+    # Let's convert to normalized coordinates.
+    
+    # Normalize by eye width (scale invariant)
+    eye_width = np.linalg.norm(eye_width_vec)
+    
+    # X Ratio: How far along the width vector?
+    # (Centered at 0)
+    x_score = x_proj / eye_width 
+    
+    # Y Score: The vertical displacement
+    # Remove the X component from the vector
+    y_vec = iris_vec - (basis_x * x_proj)
+    
+    # Ideally we'd project this onto a true "Eye Up" vector, but we don't have one easily.
+    # We can assume "Eye Up" is roughly (0, 1, 0) locally?
+    # Let's just take the Y-component of the residual vector, 
+    # BUT we must account for head roll.
+    # Alternative: Cross product of Basis X and Z-axis?
+    # Let's try simple projection onto the world Y axis first, corrected by scale.
+    # Actually, simplistic: Just taking component perpendicular to eye-width is good enough for now.
+    # Sign? In screen space Y is down.
+    # If y_vec[1] is positive -> down.
+    
+    # Let's use the magnitude of the residual, signed by its Y component.
+    y_mag = np.linalg.norm(y_vec)
+    y_sign = np.sign(y_vec[1]) 
+    y_score = (y_mag * y_sign) / eye_width
+
+    # Shift to 0.5 center for compatibility with existing calibration logic
+    # Previous range was 0.0 to 1.0. 
+    # Now it's -0.5 to 0.5 approx.
+    return 0.5 + x_score, 0.5 + y_score
 
 # ...
 screen_w, screen_h = 1920, 1080 # Default fallback
@@ -127,22 +177,33 @@ try:
             
             # ... (Landmark extraction code same as before) ...
             # --- Right Eye ---
-            right_inner = get_landmark_point(landmarks, 33, w, h)
-            right_outer = get_landmark_point(landmarks, 133, w, h)
-            right_iris = get_landmark_point(landmarks, 468, w, h)
+            right_inner = get_landmark_point_3d(landmarks, 33, w, h)
+            right_outer = get_landmark_point_3d(landmarks, 133, w, h)
+            right_iris = get_landmark_point_3d(landmarks, 468, w, h)
             
             # --- Left Eye ---
-            left_inner = get_landmark_point(landmarks, 362, w, h)
-            left_outer = get_landmark_point(landmarks, 263, w, h)
-            left_iris = get_landmark_point(landmarks, 473, w, h)
+            left_inner = get_landmark_point_3d(landmarks, 362, w, h)
+            left_outer = get_landmark_point_3d(landmarks, 263, w, h)
+            left_iris = get_landmark_point_3d(landmarks, 473, w, h)
 
             rx, ry = get_relative_iris_pos(right_inner, right_outer, right_iris)
             lx, ly = get_relative_iris_pos(left_inner, left_outer, left_iris)
             
             # Debug Vis on Camera Frame (if visible)
             if not calibration_mode:
-                cv2.circle(frame, (int(right_iris[0]), int(right_iris[1])), 2, (0, 255, 0), -1)
-                cv2.circle(frame, (int(left_iris[0]), int(left_iris[1])), 2, (0, 255, 0), -1)
+                # Project back to 2D for drawing
+                r_center = (right_inner[:2] + right_outer[:2]) / 2.0
+                l_center = (left_inner[:2] + left_outer[:2]) / 2.0
+                r_iris_2d = right_iris[:2]
+                l_iris_2d = left_iris[:2]
+
+                # Draw Eye Center to Iris vector
+                cv2.arrowedLine(frame, (int(r_center[0]), int(r_center[1])), (int(r_iris_2d[0]), int(r_iris_2d[1])), (0, 255, 255), 2)
+                cv2.arrowedLine(frame, (int(l_center[0]), int(l_center[1])), (int(l_iris_2d[0]), int(l_iris_2d[1])), (0, 255, 255), 2)
+                
+                # Draw Iris points
+                cv2.circle(frame, (int(r_iris_2d[0]), int(r_iris_2d[1])), 2, (0, 255, 0), -1)
+                cv2.circle(frame, (int(l_iris_2d[0]), int(l_iris_2d[1])), 2, (0, 255, 0), -1)
 
             avg_x = (rx + lx) / 2.0
             avg_y = (ry + ly) / 2.0

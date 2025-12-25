@@ -21,6 +21,10 @@ struct Args {
     /// Run calibration sequence
     #[arg(short, long)]
     calibrate: bool,
+    
+    /// Run diagnostics mode
+    #[arg(short, long)]
+    diagnose: bool,
 }
 
 #[derive(Deserialize, Debug)]
@@ -72,11 +76,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     
-    // ... (rest    // Smoothing state (One Euro Filter)
+    // Smoothing state (One Euro Filter)
     // MinCutoff: Lower = More smoothing when stationary (0.01 is very steady)
     // Beta: Lower = Less sensitivity to speed (0.002 reduces jitter spikes)
     // Load Calibration
     let profile = CalibrationProfile::load(calibrations_file);
+    
+    if args.diagnose {
+        run_diagnostics(&mut reader, &mut stdin, &profile, screen_width, screen_height)?;
+        println!("Diagnostics complete. Data saved to diagnostics.csv");
+        return Ok(());
+    }
+
+    // ... (rest of main loop for tracking)
     let mouse = Mouse::new();
     let mut filter_x = OneEuroFilter::new(0.01, 0.002);
     let mut filter_y = OneEuroFilter::new(0.01, 0.002);
@@ -105,6 +117,68 @@ struct TriggerMessage {
     msg_type: String,
 }
 
+fn run_diagnostics(
+    reader: &mut BufReader<ChildStdout>, 
+    writer: &mut ChildStdin, 
+    profile: &CalibrationProfile,
+    screen_w: f64,
+    screen_h: f64
+) -> std::io::Result<()> {
+    use std::fs::File;
+    
+    println!("\n=== DIAGNOSTICS MODE ===");
+    println!("We will record data for 3 seconds at 5 points.");
+    println!("Look at the RED DOT and press SPACE.");
+
+    let points = vec![
+        ("CENTER", 0.5, 0.5),
+        ("TOP LEFT", 0.05, 0.05),
+        ("TOP RIGHT", 0.95, 0.05),
+        ("BOTTOM LEFT", 0.05, 0.95),
+        ("BOTTOM RIGHT", 0.95, 0.95),
+    ];
+
+    let mut file = File::create("diagnostics.csv")?;
+    writeln!(file, "TargetName,TargetX,TargetY,RawX,RawY,MappedX,MappedY")?;
+    
+    // Give Python a moment to initialize the window
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    for (name, x, y) in points {
+        // Send command
+        let cmd = PythonCommand::CalibrationPoint { x, y };
+        writeln!(writer, "{}", serde_json::to_string(&cmd)?)?;
+        
+        println!("\nWaiting for user trigger at {}...", name);
+        wait_for_trigger(reader)?;
+
+        println!("Recording for 3 seconds...");
+        let start = time::Instant::now();
+        let duration = time::Duration::from_millis(3000);
+        let mut line = String::new();
+        
+        while start.elapsed() < duration {
+            line.clear();
+            if reader.read_line(&mut line)? > 0 {
+                 if let Ok(p) = serde_json::from_str::<GazePoint>(&line) {
+                     let raw = Point { x: p.x, y: p.y };
+                     let mapped = profile.map(&raw);
+                     
+                     writeln!(file, "{},{},{},{:.6},{:.6},{:.6},{:.6}", 
+                        name, x * screen_w, y * screen_h, 
+                        raw.x, raw.y, 
+                        mapped.x * screen_w, mapped.y * screen_h
+                     )?;
+                 }
+            }
+        }
+    }
+
+    let cmd = PythonCommand::CalibrationEnd;
+    writeln!(writer, "{}", serde_json::to_string(&cmd)?)?;
+    Ok(())
+}
+
 fn run_calibration_sequence(reader: &mut BufReader<ChildStdout>, writer: &mut ChildStdin, path: &str) -> std::io::Result<()> {
     println!("\n=== 5-POINT CALIBRATION ===");
     println!("The tracker window will go fullscreen.");
@@ -119,6 +193,9 @@ fn run_calibration_sequence(reader: &mut BufReader<ChildStdout>, writer: &mut Ch
     ];
 
     let mut results = Vec::new();
+
+    // Give Python a moment to initialize the window
+    std::thread::sleep(std::time::Duration::from_secs(2));
 
     for (name, x, y) in points {
         // Send command
